@@ -30,13 +30,16 @@ Every design decision below follows from two rules:
 | Hosting | Vercel (Hobby, free) |
 | Database + storage | Supabase (free tier — Postgres + 1GB storage) |
 | Auth | Google OAuth, **one account** (work + personal in one Gmail) |
+| App login | The same Google sign-in sets a long-lived signed session cookie. Only the owner's Google account ID is accepted; any other account is rejected |
 | Client | PWA installed to iPhone home screen |
 | Notifications | **Apple Reminders**, via Shortcuts. No PWA push |
 | Digest delivery | Appears as a message in the app's chat thread; a recurring Reminder with a URL opens it. Email in parallel during validation |
-| Digest schedule | Morning ~6:30am, evening ~6:00pm |
+| Digest schedule | Morning ~6:30am, evening ~6:00pm, **America/Chicago** |
+| Scheduler | **GitHub Actions** `schedule:` workflow in this repo, hitting the Vercel endpoint with `CRON_SECRET`. Not Vercel cron (§3.3) |
+| Digest email | Resend free tier, no custom domain. Account created with the digest recipient Gmail; sender is `onboarding@resend.dev` |
 | Digest format | Two-tier: top 3 first, everything else below |
 | Capture modes | Voice (hold-to-talk), text, photo |
-| Task sync | **Two-way** with Apple Reminders |
+| Task sync | **Two-way** with Apple Reminders. Matching key is the item UUID written into the Reminder's Notes field (§7) |
 | Chat memory | Retrieval-based, not full-context (see §6) |
 | Chat abilities | Tool use / function calling — it can actually create, complete, and reschedule |
 
@@ -64,6 +67,10 @@ that **expire after 7 days**. The cron would die every week with `invalid_grant`
   **not needed** for one self-authorized user. Do not start it.
 - Handle `invalid_grant` by surfacing "reconnect Google" in the digest, never by
   failing quietly.
+- **Verify empirically in Phase 1 step 1:** `gmail.readonly` is a *restricted* scope,
+  not merely sensitive. Confirm Google lets an unverified External app in Production
+  request it for the owner's own account. If it refuses, the fallback is a Google
+  Workspace account (Internal app type), which changes the one-consumer-Gmail decision.
 
 ### 3.2 Gemini paid tier requires Cloud Billing — the Google AI Pro subscription does NOT cover it
 A consumer Google One / Google AI Pro subscription gives Gemini in Gmail, Docs, and
@@ -75,17 +82,24 @@ AI Studio. It does **not** upgrade the Gemini API tier.
   names, addresses, and jobsite photos flow through this app — use the paid tier.
 - Expected cost at personal volume with Flash: a few dollars a month.
 
-### 3.3 Vercel Hobby cron frequency
-**Verify before relying on it.** Hobby tier may limit cron to once daily, which
-breaks the morning+evening requirement.
+### 3.3 Vercel Hobby cron — not used
+Hobby tier allows two cron jobs, each at most once per day, and fires them anywhere
+within the scheduled hour. A digest landing at 7:20 when the Reminder fires at 6:30
+is a broken experience.
 
-Free fallbacks: a GitHub Actions workflow on a `schedule:` trigger, or cron-job.org.
-Either hits the Vercel endpoint over HTTPS. Protect it with `CRON_SECRET` in a header.
+**Decision: GitHub Actions** `schedule:` workflow in this repo, hitting
+`/api/digest` over HTTPS with `CRON_SECRET` in a header. Schedules are written in UTC;
+America/Chicago needs **two entries per digest** (CST and CDT offsets) with the
+endpoint rejecting the one that's off by an hour based on local time. GitHub Actions
+can also drift a few minutes at busy times; that's acceptable, an hour is not.
 
 ### 3.4 Apple Reminders has no server-writable API
 No Apple API, no OAuth, no REST endpoint. Sync happens through two Apple Shortcuts on
 the owner's phone (§7). Do **not** use the unofficial iCloud CalDAV route — it's
 undocumented and Apple can break it without notice.
+
+Shortcuts also does not expose a stable Reminder identifier. Matching is done by
+writing the item UUID into the Reminder's Notes field (§7).
 
 ### 3.5 No background audio on iOS web
 A PWA can use mic and camera while open and in the foreground. It **cannot** listen
@@ -120,6 +134,7 @@ staleness detection.
          │                                          │
          │  Shortcuts                               │
          │   · push:  GET  /api/reminders/pending   │
+         │            (UUID goes into Reminder Notes)│
          │   · sync:  POST /api/reminders/completed │
          │   · recurring Reminder w/ app URL        │
          └──────────────────┬───────────────────────┘
@@ -157,7 +172,6 @@ create table items (
   needs_detail  boolean not null default false, -- low-confidence date or job
   confidence    real,                           -- model's own 0–1 on its extraction
   source_ref    text,                           -- gmail message id / calendar event id
-  reminder_id   text,                           -- Apple Reminders identifier
   pushed_at     timestamptz,                    -- when sent to Reminders
   completed_via text,                           -- 'app' | 'reminders' | 'digest'
   feedback      text                            -- 'not_a_task' | 'wrong_date' | null
@@ -178,6 +192,7 @@ create table messages (
   role       text not null,              -- 'user' | 'assistant'
   content    text not null,
   message_kind text default 'chat',      -- 'chat' | 'digest_morning' | 'digest_evening'
+                                         -- | 'review_weekly' (Phase 3)
   item_ids   uuid[]
 );
 
@@ -191,6 +206,7 @@ create table profile (
 
 create table google_auth (
   id            int primary key default 1,
+  google_sub    text not null,                  -- owner's Google account ID; login rejects any other
   refresh_token text not null,
   updated_at    timestamptz not null default now()
 );
@@ -215,7 +231,8 @@ without bound, and answer quality degrades as today's three real tasks get burie
 under months of chatter.
 
 Every chat turn receives:
-1. **Live state** — open tasks, today + tomorrow's calendar, recently flagged emails.
+1. **Live state** — open tasks, today + tomorrow's calendar, and items with
+   `source='gmail'` created in the last 48h (the "recently flagged emails").
    Small, fresh, always included.
 2. **Profile** — the `profile` table. Durable facts: projects, people, how the owner
    phrases things. Updated by the model when it learns something lasting. Cheap.
@@ -233,19 +250,24 @@ This feels like full memory while staying fast and cheap indefinitely.
 All endpoints authenticate with a static bearer token (`SHORTCUTS_BEARER_TOKEN`).
 Single user, so this is sufficient.
 
+Shortcuts does not expose a stable identifier for a Reminder it creates, so the app
+never learns an Apple ID. Instead the **item UUID is written into the Reminder's Notes
+field** and read back from there. No `registered` endpoint is needed.
+
 ### Shortcut A — push tasks into Reminders
 `GET /api/reminders/pending`
 - Returns `[{id, title, detail, due_at}]` where `status='open' AND pushed_at IS NULL`.
 - Sets `pushed_at` on returned rows so they aren't duplicated next run.
 - Shortcut steps: Get Contents of URL → Get Dictionary from Input → Repeat with Each
-  → Add New Reminder (with alert at `due_at`).
-- The Shortcut writes each new Reminder's identifier back via
-  `POST /api/reminders/registered` so completion can be matched later.
+  → Add New Reminder (title = `title`, alert at `due_at`, **Notes = `id`** followed by
+  `detail` on the next line).
 
 ### Shortcut B — sync completions back
-`POST /api/reminders/completed` with `{reminder_ids: [...]}`
-- Reads completed Reminders, POSTs their identifiers.
-- App marks matching items `status='done'`, `completed_via='reminders'`.
+`POST /api/reminders/completed` with `{item_ids: [...]}`
+- Finds Reminders where Is Completed is true, extracts the first line of Notes from
+  each, POSTs the resulting list.
+- App marks matching items `status='done'`, `completed_via='reminders'`. Unknown IDs
+  are ignored. Already-done IDs are idempotent.
 - **Without this, the two lists drift apart within a week and the app starts nagging
   about finished work.** This is not optional.
 
@@ -269,7 +291,14 @@ there. If any of these is stale, the digest leads with it before anything else:
 | `shortcut_push` | 24h | "Tasks haven't reached Reminders since [date]" |
 | `gmail_sync` | 12h | "Haven't been able to read email since [date]" |
 | `google_auth` | on `invalid_grant` | "Reconnect Google" + link |
-| `cron_digest` | n/a | if the digest didn't send, the email fallback catches it |
+| `cron_digest` | on app open | see below — the email cannot catch this |
+
+**Missed digest.** The email is sent by the same cron that would have died, so it is
+not a fallback for the cron itself. Detection happens **on app open**: if no
+`digest_morning` message exists for today after 6:30am local, or no `digest_evening`
+after 6:00pm local, the app shows "No [morning/evening] digest was generated" above
+the thread. The recurring Reminder opens the app at exactly those times, so this is
+seen within seconds of the failure. In Phase 1 the same check runs on the crude page.
 
 ---
 
@@ -341,8 +370,13 @@ compressed image and thumbnail in Supabase Storage, attached to the item.
 Goal: twice-daily digest landing where the owner will see it, assembled from Gmail,
 Calendar, and a crude capture.
 
-1. Google OAuth (Production status, §3.1). Scopes: `gmail.readonly`,
-   `calendar.readonly`.
+0. Console setup — see `SETUP.md`. GCP project with Cloud Billing and a budget
+   alert, Supabase project, Vercel project, Resend account. None of this exists yet.
+1. Google OAuth (Production status, §3.1). Scopes: `openid`, `gmail.readonly`,
+   `calendar.readonly`. The same flow logs the owner into the app: on callback,
+   compare the Google account ID to `google_auth.google_sub` and set a long-lived
+   signed session cookie. The crude capture page and the digest link both sit behind
+   this cookie.
 2. `/api/sync` — pull last 24–48h of Gmail. Send subject + snippet (not full body) to
    Gemini Flash: *does this contain a date, deadline, or a commitment the owner owes
    someone?* Structured JSON out. Write to `items`.
@@ -352,8 +386,9 @@ Calendar, and a crude capture.
    wrong thing.
 5. `/api/digest?kind=morning|evening` — Gemini writes the two-tier digest (§12),
    stored as a message and emailed.
-6. Cron both (§3.3).
+6. GitHub Actions schedule for both (§3.3).
 7. A crude "not a task" link in the digest.
+8. Missed-digest check on the crude page (§8).
 
 **Exit criterion: the owner opens the digest five days running without being
 reminded to.** If not, fix the digest before building anything else. Do not proceed
@@ -436,6 +471,7 @@ Defenses, in priority order:
 GOOGLE_CLIENT_ID
 GOOGLE_CLIENT_SECRET
 GOOGLE_REDIRECT_URI
+SESSION_SECRET              # signs the app login cookie
 GEMINI_API_KEY              # from a Cloud-Billing-enabled GCP project
 SUPABASE_URL
 SUPABASE_SERVICE_ROLE_KEY
@@ -444,6 +480,7 @@ DIGEST_RECIPIENT_EMAIL
 CRON_SECRET
 SHORTCUTS_BEARER_TOKEN
 APP_BASE_URL
+TZ=America/Chicago          # all "today", "morning", "evening" logic uses this
 ```
 
 ---
@@ -455,6 +492,7 @@ APP_BASE_URL
 | Vercel Hobby | $0 |
 | Supabase free tier | $0 |
 | Resend free tier | $0 |
+| GitHub Actions (scheduler) | $0 |
 | Gemini API (paid tier, personal volume) | a few dollars/month |
 
 Set a budget alert on the GCP project before first deploy. There is no hard spending
