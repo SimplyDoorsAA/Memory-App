@@ -5,6 +5,12 @@ anything — it is the source of truth for what this app is and why each decisio
 made. `SETUP.md` is the console work the owner does before Phase 1. This file is
 about *how to work here*.
 
+@AGENTS.md
+
+`AGENTS.md` is written by Next.js itself and points at the framework docs inside
+`node_modules`. This project is on Next.js 16, which differs from older versions;
+read those docs before writing framework code.
+
 Timezone for all date logic: **America/Chicago**. Scheduler: GitHub Actions, not
 Vercel cron. App login: Google sign-in sets a session cookie; only the owner's
 Google account ID is accepted.
