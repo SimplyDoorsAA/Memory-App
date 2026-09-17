@@ -35,7 +35,9 @@ home page on an authorized domain. That URL comes from Vercel, so this is step o
    - App name, user support email, developer contact email: yours. No logo
      (uploading one triggers a verification requirement).
    - Application home page: `APP_BASE_URL` from step 1.
-   - Privacy policy and terms of service links: leave blank for now.
+   - Privacy policy: `APP_BASE_URL/privacy`. Terms of service: `APP_BASE_URL/terms`.
+     Both pages exist in the app. Open them in a browser first; Google rejects
+     links that do not load.
    - Authorized domains → Add domain: `memory-app.vercel.app` (your actual
      Vercel host, without `https://`).
    - Save.
